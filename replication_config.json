@@ -1,0 +1,21 @@
+{
+  "databasePairs": [
+    {
+      "source": {
+        "region": "us-west-2",
+        "tableName": "mock-data-table-2",
+        "endpoint": "http://localhost:32331"
+      },
+      "target": {
+        "projectId": "test-project",
+        "instanceId": "test-202304",
+        "databaseId": "testdb",
+        "tableName": "mock_data_table_2"
+      }
+    }
+  ],
+  "checkpointFrequency": 10,
+  "batchSize": 1000,
+  "maxRetries": 3,
+  "retryDelayMs": 1000
+}
