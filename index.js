@@ -1,7 +1,8 @@
 import { DynamoDB } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocument } from '@aws-sdk/lib-dynamodb';
 import { DynamoDBStreams, DescribeStreamCommand, GetShardIteratorCommand, GetRecordsCommand } from "@aws-sdk/client-dynamodb-streams";
-import { Spanner } from '@google-cloud/spanner';
+import { DescribeTableCommand } from "@aws-sdk/client-dynamodb";
+import { Spanner, MutationSet } from '@google-cloud/spanner';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -117,7 +118,8 @@ function convertToSpannerType(value) {
   }
 
   if (typeof value === 'number' || (typeof value === 'string' && !isNaN(Number(value)))) {
-    return convertDynamoDBNumberToSpanner(value);
+    // return convertDynamoDBNumberToSpanner(value);
+    return Number(value);
   }
 
   if (Array.isArray(value) || typeof value === 'object') {
@@ -161,17 +163,17 @@ async function migrateTable(ddbClient, spannerTable, tableConfig) {
         for (let i = 0; i < Items.length; i += batchSize) {
           const batch = Items.slice(i, i + batchSize);
           
-          // console.log('Original DynamoDB items:', JSON.stringify(batch, null, 2));
-
           // Convert DynamoDB items to Spanner rows
           const rows = batch.map(convertItemToRow);
-          // console.log('Converted rows with types:', JSON.stringify(rows, null, 2));
-
+          
           try {
-            // Insert batch of rows into Spanner with proper types
-            const formattedRows = rows.map(row => {
+            // Create a new MutationSet for the batch
+            const mutations = new MutationSet();
+            
+            // Format rows and add to mutation set
+            rows.forEach(row => {
               const formattedRow = {};
-              for (const [key, value] of Object.entries(row)) {
+              for (const [key, value] of Object.entries(row)) { 
                 if (value && value.type && value.value) {
                   // Handle typed values (numbers)
                   if (value.type === 'FLOAT64') {
@@ -184,11 +186,22 @@ async function migrateTable(ddbClient, spannerTable, tableConfig) {
                   formattedRow[key] = value;
                 }
               }
-              return formattedRow;
+              mutations.insert(tableConfig.target.tableName, formattedRow);
             });
 
-            // console.log('Final formatted rows for Spanner:', JSON.stringify(formattedRows, null, 2));
-            await spannerTable.insert(formattedRows);
+            // Write mutations using writeAtLeastOnce
+            await new Promise((resolve, reject) => {
+              spannerTable.database.writeAtLeastOnce(mutations, (err, res) => {
+                if (err) {
+                  console.error(`Error writing batch starting at item ${i}:`, err);
+                  reject(err);
+                } else {
+                  console.log(`Successfully wrote batch of ${rows.length} items.`);
+                  resolve(res);
+                }
+              });
+            });
+            
             console.log(`Processed batch of ${rows.length} items`);
           } catch (error) {
             console.error(`Error inserting batch starting at item ${i}:`, error);
@@ -206,44 +219,88 @@ async function migrateTable(ddbClient, spannerTable, tableConfig) {
 }
 
 // Function to get initial sequence number for live replication
-async function getInitialSequenceNumber(region, tableName, endpoint) {
+async function getInitialSequenceNumber(region, tableName, endpoint, retryCount = 0) {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 1000;
+
   try {
-    const ddb = new DynamoDB({ 
+    const ddb = new DynamoDB({
       region,
-      endpoint
+      endpoint,
     });
-    const { Table } = await ddb.describeTable({ TableName: tableName });
-    
+    const describeTableCommand = new DescribeTableCommand({ TableName: tableName });
+    const { Table } = await ddb.send(describeTableCommand);
+
     if (!Table.LatestStreamArn) {
-      throw new Error('DynamoDB Streams is not enabled on the source table');
+      throw new Error("DynamoDB Streams is not enabled on the source table");
     }
-    
-    const streamClient = new DynamoDBStreams({ 
+
+    const streamClient = new DynamoDBStreams({
       region,
-      endpoint
+      endpoint,
     });
-    const { Shards } = await streamClient.describeStream({ StreamArn: Table.LatestStreamArn });
-    
-    if (!Shards || Shards.length === 0) {
+
+    // Get the latest stream description
+    const describeStreamCommand = new DescribeStreamCommand({ StreamArn: Table.LatestStreamArn });
+    const { StreamDescription } = await streamClient.send(describeStreamCommand);
+
+    if (!StreamDescription.Shards || StreamDescription.Shards.length === 0) {
+      console.log("No shards found in the stream");
       return null;
     }
-    
-    // Get the oldest shard's iterator
-    const { ShardIterator } = await streamClient.getShardIterator({
-      StreamArn: Table.LatestStreamArn,
-      ShardId: Shards[0].ShardId,
-      ShardIteratorType: 'TRIM_HORIZON'
+
+    // Sort shards by sequence number to get the most recent ones first
+    const sortedShards = [...StreamDescription.Shards].sort((a, b) => {
+      const seqA = a.SequenceNumberRange.StartingSequenceNumber;
+      const seqB = b.SequenceNumberRange.StartingSequenceNumber;
+      return seqB.localeCompare(seqA);
     });
+
+    // Try each shard until we find a valid one
+    for (const shard of sortedShards) {
+      try {
+        // Start with AT_SEQUENCE_NUMBER at the shard's starting sequence number
+        const startingSeqNum = shard.SequenceNumberRange.StartingSequenceNumber;
+        const getShardIteratorCommand = new GetShardIteratorCommand({
+          StreamArn: Table.LatestStreamArn,
+          ShardId: shard.ShardId,
+          ShardIteratorType: "AT_SEQUENCE_NUMBER",
+          SequenceNumber: startingSeqNum
+        });
+        
+        const { ShardIterator } = await streamClient.send(getShardIteratorCommand);
+        
+        // Verify the iterator is valid by getting records
+        const getRecordsCommand = new GetRecordsCommand({
+          ShardIterator: ShardIterator,
+          Limit: 1
+        });
+        
+        const { Records } = await streamClient.send(getRecordsCommand);
+        
+        // If we successfully got records or an empty result, the shard is valid
+        return startingSeqNum;
+      } catch (shardError) {
+        if (shardError.name === 'ResourceNotFoundException') {
+          console.warn(`Shard ${shard.ShardId} no longer exists, trying next shard...`);
+          continue;
+        }
+        console.warn(`Warning: Failed to get iterator for shard ${shard.ShardId}:`, shardError);
+        continue;
+      }
+    }
     
-    // Get the first record's sequence number
-    const { Records } = await streamClient.getRecords({
-      ShardIterator: ShardIterator,
-      Limit: 1
-    });
+    // If we've exhausted all shards and retries are available, wait and try again
+    if (retryCount < MAX_RETRIES) {
+      console.log(`No valid shards found, retrying (attempt ${retryCount + 1}/${MAX_RETRIES})...`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * Math.pow(2, retryCount)));
+      return getInitialSequenceNumber(region, tableName, endpoint, retryCount + 1);
+    }
     
-    return Records && Records.length > 0 ? Records[0].dynamodb.SequenceNumber : null;
+    console.log("No valid shards found after all retries, returning null");
+    return null;
   } catch (error) {
-    console.error('Error getting initial sequence number:', error);
+    console.error("Error getting initial sequence number:", error);
     throw error;
   }
 }
@@ -258,7 +315,11 @@ async function startLiveReplication(ddbClient, spannerTable, tableConfig, startS
       region: tableConfig.source.region,
       endpoint: tableConfig.source.endpoint
     });
-    const { Table } = await ddb.describeTable({ TableName: tableConfig.source.tableName });
+    
+    const describeTableCommand = new DescribeTableCommand({ 
+      TableName: tableConfig.source.tableName 
+    });
+    const { Table } = await ddb.send(describeTableCommand);
     
     if (!Table.LatestStreamArn) {
       throw new Error('DynamoDB Streams is not enabled on the source table');
@@ -271,30 +332,67 @@ async function startLiveReplication(ddbClient, spannerTable, tableConfig, startS
     });
 
     // Get stream shards
-    const { Shards } = await streamClient.describeStream({ StreamArn: streamArn });
+    const describeStreamCommand = new DescribeStreamCommand({ 
+      StreamArn: streamArn 
+    });
+    const { StreamDescription } = await streamClient.send(describeStreamCommand);
+    const shards = StreamDescription.Shards;
+
+    if (!shards || shards.length === 0) {
+      console.log('No shards found in the stream');
+      return;
+    }
 
     // Load checkpoints for this table
     const checkpoints = await loadCheckpoint(tableConfig.source.tableName);
     console.log('Loaded checkpoints:', checkpoints);
 
     // Process each shard
-    for (const shard of Shards) {
-      // Use checkpoint if available, otherwise use startSequenceNumber
-      const checkpointSequenceNumber = checkpoints[shard.ShardId];
-      const sequenceNumber = checkpointSequenceNumber || startSequenceNumber;
-      
-      if (checkpointSequenceNumber) {
-        console.log(`Resuming shard ${shard.ShardId} from checkpoint: ${checkpointSequenceNumber}`);
+    for (const shard of shards) {
+      try {
+        // Get the shard's sequence number range
+        const shardStartSeq = shard.SequenceNumberRange.StartingSequenceNumber;
+        const shardEndSeq = shard.SequenceNumberRange.EndingSequenceNumber;
+        
+        // Use checkpoint if available
+        const checkpointSequenceNumber = checkpoints[shard.ShardId];
+        
+        // Determine the appropriate sequence number to start from
+        let sequenceNumber = null;
+        if (checkpointSequenceNumber) {
+          console.log(`Found checkpoint for shard ${shard.ShardId}: ${checkpointSequenceNumber}`);
+          sequenceNumber = checkpointSequenceNumber;
+        } else if (startSequenceNumber) {
+          // Only use startSequenceNumber if it falls within this shard's range
+          const startSeqBigInt = BigInt(startSequenceNumber);
+          const shardStartBigInt = BigInt(shardStartSeq);
+          const shardEndBigInt = shardEndSeq ? BigInt(shardEndSeq) : BigInt(Number.MAX_SAFE_INTEGER);
+          
+          if (startSeqBigInt >= shardStartBigInt && startSeqBigInt <= shardEndBigInt) {
+            console.log(`Using initial sequence number for shard ${shard.ShardId}: ${startSequenceNumber}`);
+            sequenceNumber = startSequenceNumber;
+          }
+        }
+        
+        // If no valid sequence number is found, use the shard's start sequence
+        if (!sequenceNumber) {
+          console.log(`Starting from beginning of shard ${shard.ShardId} with sequence number: ${shardStartSeq}`);
+          sequenceNumber = shardStartSeq;
+        }
+        
+        await processStreamRecords(
+          streamClient,
+          spannerTable,
+          tableConfig,
+          streamArn,
+          shard.ShardId,
+          sequenceNumber
+        );
+      } catch (error) {
+        console.error(`Error processing shard ${shard.ShardId}:`, error);
+        // Continue with next shard
+        continue;
       }
-      
-      processStreamRecords(
-        streamClient,
-        spannerTable,
-        tableConfig,
-        streamArn,
-        shard.ShardId,
-        sequenceNumber
-      );
     }
   } catch (error) {
     console.error(`Error starting live replication for ${tableConfig.source.tableName}:`, error);
@@ -308,12 +406,12 @@ async function processStreamRecords(streamClient, spannerTable, tableConfig, str
 
   try {
     // Determine iterator type and sequence number
-    let iteratorType = 'TRIM_HORIZON';
-    let sequenceNumber = null;
+    let iteratorType = 'AT_SEQUENCE_NUMBER';
+    let sequenceNumber = startSequenceNumber;
 
-    if (startSequenceNumber) {
-      iteratorType = 'AT_SEQUENCE_NUMBER';
-      sequenceNumber = startSequenceNumber;
+    if (!sequenceNumber) {
+      iteratorType = 'TRIM_HORIZON';
+      sequenceNumber = null;
     }
 
     const iteratorParams = {
@@ -329,21 +427,24 @@ async function processStreamRecords(streamClient, spannerTable, tableConfig, str
     let currentShardIterator = ShardIterator;
 
     while (currentShardIterator) {
-      const { Records, NextShardIterator } = await streamClient.getRecords({
-        ShardIterator: currentShardIterator
-      });
+      try {
+        const { Records, NextShardIterator } = await streamClient.getRecords({
+          ShardIterator: currentShardIterator
+        });
 
-      if (Records && Records.length > 0) {
-        let processedRecords = 0;
-        const totalRecords = Records.length;
-        const lastSequenceNumber = Records[Records.length - 1].dynamodb.SequenceNumber;
-        // Process records in transaction batches
-        const batchSize = config.batchSize || 1000;
-        const recordBatches = [];
-        
-        for (let i = 0; i < Records.length; i += batchSize) {
-          recordBatches.push(Records.slice(i, i + batchSize));
-        }
+        if (Records && Records.length > 0) {
+          console.log('Processing records:', JSON.stringify(Records, null, 2));
+          let processedRecords = 0;
+          const totalRecords = Records.length;
+          const lastSequenceNumber = Records[Records.length - 1].dynamodb.SequenceNumber;
+          
+          // Process records in transaction batches
+          const batchSize = config.batchSize || 1000;
+          const recordBatches = [];
+          
+          for (let i = 0; i < Records.length; i += batchSize) {
+            recordBatches.push(Records.slice(i, i + batchSize));
+          }
 
         for (const batch of recordBatches) {
           let retries = 0;
@@ -351,46 +452,105 @@ async function processStreamRecords(streamClient, spannerTable, tableConfig, str
 
           while (!success && retries < MAX_RETRIES) {
             try {
-              await spannerTable.database.runTransaction(async (transaction) => {
-                for (const record of batch) {
-                  switch (record.eventName) {
-                    case 'INSERT':
-                    case 'MODIFY': {
-                      const row = convertItemToRow(record.dynamodb.NewImage);
-                      const formattedRow = {};
-                      for (const [key, value] of Object.entries(row)) {
-                        if (value && value.type && value.value) {
-                          if (value.type === 'FLOAT64') {
-                            formattedRow[key] = Number(value.value);
-                          } else if (value.type === 'INT64') {
-                            formattedRow[key] = value.value;
-                          } else {
-                            formattedRow[key] = value.value;
+              const mutations = new MutationSet();
+
+              for (const record of batch) {
+                const formattedRow = {};
+                switch (record.eventName) {
+                  case 'INSERT':
+                  case 'MODIFY': {
+                    for (const [key, value] of Object.entries(record.dynamodb.NewImage)) {
+                      if (value.N) {
+                        formattedRow[key] = Number(value.N);
+                      } else if (value.S) {
+                        formattedRow[key] = value.S;
+                      } else if (value.BOOL !== undefined) {
+                        formattedRow[key] = value.BOOL;
+                      } else if (value.M) {
+                        const mapValue = {};
+                        for (const [mapKey, mapVal] of Object.entries(value.M)) {
+                          if (mapVal.N) {
+                            mapValue[mapKey] = Number(mapVal.N);
+                          } else if (mapVal.S) {
+                            mapValue[mapKey] = mapVal.S;
+                          } else if (mapVal.BOOL !== undefined) {
+                            mapValue[mapKey] = mapVal.BOOL;
+                          } else if (mapVal.M) {
+                            // Handle nested maps recursively
+                            const nestedMap = {};
+                            for (const [nestedKey, nestedVal] of Object.entries(mapVal.M)) {
+                              if (nestedVal.N) {
+                                nestedMap[nestedKey] = Number(nestedVal.N);
+                              } else if (nestedVal.S) {
+                                nestedMap[nestedKey] = nestedVal.S;
+                              } else if (nestedVal.BOOL !== undefined) {
+                                nestedMap[nestedKey] = nestedVal.BOOL;
+                              }
+                            }
+                            mapValue[mapKey] = nestedMap;
                           }
-                        } else {
-                          formattedRow[key] = value;
                         }
+                        formattedRow[key] = mapValue;
+                      } else {
+                        formattedRow[key] = value;
                       }
-                      transaction.upsert(tableConfig.target.tableName, formattedRow);
-                      break;
                     }
-                    case 'REMOVE': {
-                      const keys = convertItemToRow(record.dynamodb.Keys);
-                      const formattedKeys = {};
-                      for (const [key, value] of Object.entries(keys)) {
-                        if (value && value.type && value.value) {
-                          formattedKeys[key] = value.type === 'FLOAT64' ? Number(value.value) : value.value;
-                        } else {
-                          formattedKeys[key] = value;
+                    mutations.insert(tableConfig.target.tableName, formattedRow);
+                    break;
+                  }
+                  case 'REMOVE': {
+                    for (const [key, value] of Object.entries(record.dynamodb.Keys)) {
+                      if (value.N) {
+                        formattedRow[key] = Number(value.N);
+                      } else if (value.S) {
+                        formattedRow[key] = value.S;
+                      } else if (value.BOOL !== undefined) {
+                        formattedRow[key] = value.BOOL;
+                      } else if (value.M) {
+                        const mapValue = {};
+                        for (const [mapKey, mapVal] of Object.entries(value.M)) {
+                          if (mapVal.N) {
+                            mapValue[mapKey] = Number(mapVal.N);
+                          } else if (mapVal.S) {
+                            mapValue[mapKey] = mapVal.S;
+                          } else if (mapVal.BOOL !== undefined) {
+                            mapValue[mapKey] = mapVal.BOOL;
+                          } else if (mapVal.M) {
+                            // Handle nested maps recursively
+                            const nestedMap = {};
+                            for (const [nestedKey, nestedVal] of Object.entries(mapVal.M)) {
+                              if (nestedVal.N) {
+                                nestedMap[nestedKey] = Number(nestedVal.N);
+                              } else if (nestedVal.S) {
+                                nestedMap[nestedKey] = nestedVal.S;
+                              } else if (nestedVal.BOOL !== undefined) {
+                                nestedMap[nestedKey] = nestedVal.BOOL;
+                              }
+                            }
+                            mapValue[mapKey] = nestedMap;
+                          }
                         }
+                        formattedRow[key] = mapValue;
+                      } else {
+                        formattedRow[key] = value;
                       }
-                      transaction.delete(tableConfig.target.tableName, formattedKeys);
-                      break;
                     }
+                    mutations.delete(tableConfig.target.tableName, formattedRow);
+                    break;
                   }
                 }
-                await transaction.commit();
-                console.log(`Processed batch of ${batch.length} records in transaction`);
+              }
+
+              await new Promise((resolve, reject) => {
+                spannerTable.database.writeAtLeastOnce(mutations, (err, res) => {
+                  if (err) {
+                    console.error('Error writing mutations:', err);
+                    reject(err);
+                    return;
+                  }
+                  console.log(`Successfully processed batch of ${batch.length} records. Response:`, res);
+                  resolve(res);
+                });
               });
 
               // Update processed records count
@@ -424,9 +584,22 @@ async function processStreamRecords(streamClient, spannerTable, tableConfig, str
         }
       }
 
-      // Wait before getting more records to avoid hitting rate limits
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      currentShardIterator = NextShardIterator;
+        // Wait before getting more records to avoid hitting rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        if (!NextShardIterator) {
+          console.log(`Reached end of shard ${shardId}`);
+          break;
+        }
+        
+        currentShardIterator = NextShardIterator;
+      } catch (error) {
+        if (error.$metadata?.httpStatusCode === 400 && error.name === 'ResourceNotFoundException') {
+          console.log(`Shard iterator expired or invalid for shard ${shardId}, stopping processing`);
+          break;
+        }
+        throw error;
+      }
     }
   } catch (error) {
     console.error(`Error processing stream records for shard ${shardId}:`, error);
@@ -462,6 +635,7 @@ async function processDatabase(sourceConfig, targetConfig, mode) {
         sourceConfig.tableName,
         sourceConfig.endpoint
       );
+      
       
       // Perform migration
       await migrateTable(ddbClient, table, { source: sourceConfig, target: targetConfig });
