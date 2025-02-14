@@ -95,6 +95,20 @@ aws dynamodb create-table \
     --endpoint-url http://localhost:32331
 ```
 
+```bash
+aws dynamodb create-table \
+    --table-name mock-data-table-2 \
+    --attribute-definitions \
+        AttributeName=id,AttributeType=S \
+    --key-schema \
+        AttributeName=id,KeyType=HASH \
+    --provisioned-throughput \
+        ReadCapacityUnits=5,WriteCapacityUnits=5 \
+    --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \
+    --region us-west-2 \
+    --endpoint-url http://localhost:32331
+```
+
 This command:
 - Creates a table named 'mock-data-table'
 - Sets 'id' as the primary key (String type)
