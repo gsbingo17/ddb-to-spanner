@@ -63,7 +63,7 @@ The generated mock data includes the following fields:
 1. Install dependencies:
 
    ```bash
-   npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
+   npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb @google-cloud/spanner
    ```
 
 ## Configuration

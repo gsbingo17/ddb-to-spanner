@@ -3,7 +3,7 @@ import { DynamoDBDocument } from '@aws-sdk/lib-dynamodb';
 
 // Configuration
 const config = {
-  tableName: 'mock-data-table-2', // Change this to your table name
+  tableName: 'mock-data-table', // Change this to your table name
   rowCount: 200, // Change this to desired number of rows
   region: 'us-west-2' // Change this to your region
 };
