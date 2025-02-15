@@ -15,7 +15,7 @@ This script replicates data from DynamoDB tables to Cloud Spanner tables. It sup
 - Google Cloud project with Cloud Spanner enabled
 - AWS credentials configured (see [AWS Credentials Configuration](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/setting-credentials-node.html))
 - Google Cloud service account with permissions to access Cloud Spanner (see [Creating Service Accounts](https://cloud.google.com/iam/docs/creating-managing-service-accounts))
-- Schema transformation and Spanner database table creation must be completed in advance of the data migration.
+- **Schema conversion and Spanner database table creation must be completed in advance of the data migration.**
 
 ## Installation
 
