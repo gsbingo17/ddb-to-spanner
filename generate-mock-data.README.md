@@ -84,7 +84,7 @@ Before running the generator, create the DynamoDB table using AWS CLI:
 
 ```bash
 aws dynamodb create-table \
-    --table-name mock-data-table-1 \
+    --table-name mock-data-table \
     --attribute-definitions \
         AttributeName=id,AttributeType=S \
     --key-schema \
@@ -97,7 +97,7 @@ aws dynamodb create-table \
 
 ```bash
 aws dynamodb create-table \
-    --table-name mock-data-table-2 \
+    --table-name mock-data-table \
     --attribute-definitions \
         AttributeName=id,AttributeType=S \
     --key-schema \
@@ -147,7 +147,7 @@ You can execute this DDL using the gcloud CLI:
 ```bash
 # Create the DDL file
 cat > create_table.sql << EOL
-CREATE TABLE mock_data_table_1 (
+CREATE TABLE mock_data_table (
   id STRING(36) NOT NULL,
   stringField STRING(MAX),
   floatField FLOAT64,
