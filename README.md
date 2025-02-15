@@ -1,6 +1,6 @@
 # DynamoDB to Cloud Spanner Replication
 
-This script replicates data from a DynamoDB table to a Cloud Spanner table. It supports two modes of operation:
+This script replicates data from DynamoDB tables to Cloud Spanner tables. It supports two modes of operation:
 
 - **Migrate:** Performs a one-time migration of data from DynamoDB to Cloud Spanner.
 - **Live:** Sets up a live replication using DynamoDB Streams to continuously synchronize data between the two databases. This includes:
@@ -15,6 +15,7 @@ This script replicates data from a DynamoDB table to a Cloud Spanner table. It s
 - Google Cloud project with Cloud Spanner enabled
 - AWS credentials configured (see [AWS Credentials Configuration](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/setting-credentials-node.html))
 - Google Cloud service account with permissions to access Cloud Spanner (see [Creating Service Accounts](https://cloud.google.com/iam/docs/creating-managing-service-accounts))
+- Schema transformation and Spanner database table creation must be completed in advance of the data migration.
 
 ## Installation
 
@@ -182,6 +183,8 @@ The script includes robust error handling:
   - Parallel scanning is disabled by default
   - Enable parallel scanning by providing --segment and --totalSegments arguments
   - Each process scans a different segment of the table in parallel
+* For more information about Cloud Spanner operations, see:
+  - https://googleapis.dev/nodejs/spanner/latest/index.html
 
-For more information about Cloud Spanner operations, see:
-https://googleapis.dev/nodejs/spanner/latest/index.html
+
+
