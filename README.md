@@ -67,30 +67,47 @@ Configuration parameters:
   - `databaseId`: Your Cloud Spanner database ID
   - `tableName`: Name of the target Cloud Spanner table
 
+## Checkpoint System
+
+The script uses a timestamp-based checkpoint system to track replication progress:
+
+```json
+{
+  "checkpoints": {
+    "sourceTableName": 1708020000000  // Timestamp in milliseconds
+  }
+}
+```
+
+- Each table's checkpoint is stored as a Unix timestamp in milliseconds
+- The checkpoint represents the point in time up to which records have been processed
+- When restarting replication, records are filtered based on their ApproximateCreationDateTime
+- Records with timestamps older than the checkpoint are skipped
+- Checkpoints are updated periodically based on the checkpointFrequency setting
+
+## Live Replication Process
+
+1. **Initial Setup**
+   - Gets current timestamp as the starting point
+   - Performs initial data migration
+   - Starts stream processing from the saved timestamp
+
+2. **Stream Processing**
+   - Uses TRIM_HORIZON to read all available records
+   - Filters records based on their ApproximateCreationDateTime
+   - Only processes records newer than the checkpoint timestamp
+   - Handles INSERT, MODIFY, and REMOVE operations
+
+3. **Checkpoint Management**
+   - Saves checkpoints after processing batches of records
+   - Uses atomic file operations to ensure checkpoint integrity
+   - Automatically resumes from last checkpoint after interruption
+
 ## Data Type Conversions
 
 The script handles the following data type conversions from DynamoDB to Cloud Spanner:
 
-1. **Numbers**
-   - Integers within INT64 range (-9223372036854775808 to 9223372036854775807):
-     ```javascript
-     // DynamoDB
-     { "count": 42 }
-     // Spanner
-     count: "42" // INT64 value in Spanner after type detection
-     ```
-   - Integers outside INT64 range or floating-point numbers:
-     ```javascript
-     // DynamoDB
-     { "price": 99.99, "bigNum": 9223372036854775808 }
-     // Spanner
-     price: "99.99", // FLOAT64 value in Spanner after type detection
-     bigNum: "9.223372036854776e+18" // FLOAT64 value in Spanner after overflow detection
-     ```
-   - Numbers stored as strings in DynamoDB are properly parsed and converted
-   - Automatic overflow detection and conversion to FLOAT64 when needed
-
-2. **Complex Types**
+1. **Complex Types**
    - Objects and arrays are converted to JSON strings:
      ```javascript
      // DynamoDB
@@ -103,12 +120,28 @@ The script handles the following data type conversions from DynamoDB to Cloud Sp
      tags: '["tag1","tag2"]'
      ```
 
-3. **Other Types**
-   - Booleans are preserved as-is
-   - Strings are preserved as-is
+2. **Basic Types**
+   - Strings/Numbers/Booleans are preserved as-is
    - Null/undefined values are properly handled
 
-The script includes robust type checking and validation to ensure data integrity during conversion.
+## Error Handling and Retries
+
+The script includes robust error handling:
+
+1. **Transaction Retries**
+   - Failed transactions are retried up to maxRetries times
+   - Exponential backoff between retries (retryDelayMs * 2^attempt)
+   - Special handling for ALREADY_EXISTS errors
+
+2. **Stream Processing**
+   - Handles expired shard iterators
+   - Continues processing other shards if one fails
+   - Rate limiting to avoid hitting DynamoDB Streams limits
+
+3. **Checkpoint Safety**
+   - Uses temporary files for atomic checkpoint updates
+   - Cleans up temporary files on error
+   - Validates checkpoint data on load
 
 ## Usage
 
@@ -133,22 +166,22 @@ The script includes robust type checking and validation to ensure data integrity
 ## Notes
 
 * For live replication, ensure DynamoDB Streams is enabled on your source table
-* Checkpoint frequency can be adjusted in replication_config.json:
-  ```json
-  {
-    "checkpointFrequency": 100,  // Save checkpoint every 100 records
-    "batchSize": 1000,           // Process records in batches of 1000
-    "maxRetries": 3,             // Retry failed transactions up to 3 times
-    "retryDelayMs": 1000         // Wait 1 second between retries (doubles on each retry)
-  }
-  ```
-* Checkpoints are stored in checkpoint.json and are used to resume replication from the last saved position
-* If the replication process is interrupted, it will automatically resume from the last checkpoint
 * The script uses DynamoDB's DocumentClient for simplified interaction with DynamoDB
-* Cloud Spanner operations use Table.insert() and Table.delete() methods for efficient batch processing (controlled by batchSize in config)
-* Numbers are automatically detected as INT64 or FLOAT64 and converted appropriately
-* Complex data types (arrays, objects) are automatically converted to JSON strings
-* Progress logging shows batch processing status
-* The script includes rate limiting to avoid hitting DynamoDB Streams read limits
-* Error handling is implemented for both DynamoDB and Cloud Spanner operations
-* For large tables, the migration process uses pagination to handle the data in chunks
+* Cloud Spanner operations use writeAtLeastOnce for efficient batch processing
+* Progress logging shows batch processing status and timestamp filtering details
+* For large tables:
+  - The migration process uses pagination to handle the data in chunks
+  - Optional parallel scanning for improved performance:
+    ```bash
+    # Run multiple processes with different segment values
+    node index.js migrate --segment 0 --totalSegments 4  # Process 1
+    node index.js migrate --segment 1 --totalSegments 4  # Process 2
+    node index.js migrate --segment 2 --totalSegments 4  # Process 3
+    node index.js migrate --segment 3 --totalSegments 4  # Process 4
+    ```
+  - Parallel scanning is disabled by default
+  - Enable parallel scanning by providing --segment and --totalSegments arguments
+  - Each process scans a different segment of the table in parallel
+
+For more information about Cloud Spanner operations, see:
+https://googleapis.dev/nodejs/spanner/latest/index.html
