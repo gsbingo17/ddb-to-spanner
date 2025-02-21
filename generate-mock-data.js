@@ -4,8 +4,9 @@ import { DynamoDBDocument } from '@aws-sdk/lib-dynamodb';
 // Configuration
 const config = {
   tableName: 'mock-data-table', // Change this to your table name
-  rowCount: 200, // Change this to desired number of rows
-  region: 'us-west-2' // Change this to your region
+  rowCount: 10000000, // Change this to desired number of rows
+  region: 'us-west-2', // Change this to your region
+  chunkSize: 1000 // Process this many items at a time
 };
 
 // Initialize DynamoDB client
@@ -17,7 +18,7 @@ const ddbClient = DynamoDBDocument.from(new DynamoDB({
     convertClassInstanceToMap: true,
     removeUndefinedValues: true,
     convertEmptyValues: false,
-    numberAsString: true  // This will preserve float numbers by storing them as strings
+    numberAsString: true
   }
 });
 
@@ -28,7 +29,6 @@ function generateString(prefix = '') {
 
 // Function to generate random float
 function generateFloat(min = 0, max = 1000) {
-  // Add a small random decimal (0.01 to 0.99) to ensure we never get whole numbers
   const randomDecimal = Math.random() * 0.99 + 0.01;
   return parseFloat((Math.random() * (max - min) + min + randomDecimal).toFixed(2));
 }
@@ -104,26 +104,46 @@ async function batchWriteItems(items) {
 
     try {
       await ddbClient.batchWrite(params);
-      console.log(`Wrote batch of ${batch.length} items (${i + 1} to ${i + batch.length})`);
+      console.log(`Wrote batch of ${batch.length} items`);
     } catch (error) {
-      console.error(`Error writing batch starting at item ${i + 1}:`, error);
+      console.error(`Error writing batch:`, error);
       throw error;
     }
   }
 }
 
-// Main function to generate and write mock data
+// Main function to generate and write mock data in chunks
 async function generateMockData() {
   console.log(`Generating ${config.rowCount} mock items for table ${config.tableName}...`);
   
-  const items = Array.from({ length: config.rowCount }, (_, i) => generateMockItem(i + 1));
-  
-  try {
+  let processedCount = 0;
+  const startTime = Date.now();
+
+  while (processedCount < config.rowCount) {
+    // Generate a chunk of items
+    const chunkSize = Math.min(config.chunkSize, config.rowCount - processedCount);
+    const items = Array.from({ length: chunkSize }, (_, i) => 
+      generateMockItem(processedCount + i + 1)
+    );
+
+    // Write the chunk
     await batchWriteItems(items);
-    console.log('Successfully generated all mock data!');
-  } catch (error) {
-    console.error('Error generating mock data:', error);
+    
+    processedCount += chunkSize;
+    
+    // Calculate and log progress
+    const elapsedMinutes = (Date.now() - startTime) / 60000;
+    const itemsPerMinute = processedCount / elapsedMinutes;
+    const remainingItems = config.rowCount - processedCount;
+    const estimatedMinutesRemaining = remainingItems / itemsPerMinute;
+    
+    console.log(`Progress: ${processedCount.toLocaleString()} / ${config.rowCount.toLocaleString()} items (${(processedCount/config.rowCount*100).toFixed(2)}%)`);
+    console.log(`Rate: ${Math.round(itemsPerMinute)} items/minute`);
+    console.log(`Estimated time remaining: ${Math.round(estimatedMinutesRemaining)} minutes\n`);
   }
+
+  const totalMinutes = (Date.now() - startTime) / 60000;
+  console.log(`Successfully generated all mock data in ${totalMinutes.toFixed(2)} minutes!`);
 }
 
 // Run the generator
